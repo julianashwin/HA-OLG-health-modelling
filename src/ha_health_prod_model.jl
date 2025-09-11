@@ -1,3 +1,10 @@
+if occursin("jashwin", pwd())
+    cd("C://Users/jashwin/Documents/GitHub/HA-OLG-health-modelling/")
+else
+    cd("/Users/julianashwin/Documents/GitHub/HA-OLG-health-modelling/")
+end
+
+
 # Heterogeneous-agents model with binary health and productivity
 # Filename: ha_health_prod_model.jl
 # - Agents live up to A_max periods (ages 1..A_max)
@@ -11,54 +18,41 @@
 # - Solve by backward induction (finite horizon) with interpolation in asset grid
 
 using LinearAlgebra
-using Statistics
-using Random
-using Distributions
-using Printf
-using Roots
-using Plots 
-
-try
-    using Interpolations
-catch
-    @warn "Install Interpolations.jl for faster interpolation (optional)."
-end
+using Statistics, Random, Distributions
+using Printf, Plots, FreqTables
+using Interpolations, Roots
+using Filesystem: mkpath
 
 ##########################
 # 0. High-level choices
 ##########################
 A_max = 100            # maximum age / lifespan (periods)
-A_retire = 66          # optional: retirement age (not used here)
-r = 0.03               # exogenous interest rate
-β = 0.96               # discount factor
-γ = 2.0                # CRRA for consumption
-φ = 1.0                # labor disutility curvature: disutil ~ l^{1+φ}/(1+φ)
-ψ_good = 1.0           # scale of disutility when healthy
-ψ_bad = 2.0            # scale when unhealthy (higher disutility)
-w = 1.0                # wage (can be age-dependent later)
+A_retire = 66
+r = 0.03
+β = 0.96
+γ = 2.0
+φ = 1.0
+ψ_good = 1.0
+ψ_bad = 2.0
+w = 1.0
 
 # asset grid
 na = 500
 a_min = 0.0
 a_max = 200.0
-# use denser grid near zero
 a_grid = [a_min; collect(range(1e-6, 1.0, length=50)); collect(range(1.0,10.0,length=150)); collect(range(10.0,a_max,length=na-201))]
 na = length(a_grid)
 
 ##########################
 # 1. Binary Markov processes
 ##########################
-# Productivity: low(1), high(2)
-π_z = [0.9 0.1; 0.1 0.9]    # rows: from-state, cols: to-state
-z_vals = [0.6, 1.4]         # productivity multipliers
+π_z = [0.9 0.1; 0.1 0.9]
+z_vals = [0.6, 1.4]
 
-# Health: good(1), bad(2)
 π_h = [0.95 0.05; 0.2 0.8]
-# disutility scale by health
 ψ_h = [ψ_good, ψ_bad]
 
-# Joint transition for (z,h) assuming independence between processes
-# indices: s = 1..4 mapping (z,h): (1,1)->1, (2,1)->2, (1,2)->3, (2,2)->4
+# Joint states: index -> (z_index, h_index)
 states = [(1,1),(2,1),(1,2),(2,2)]
 s = length(states)
 Π = zeros(s,s)
@@ -69,25 +63,22 @@ for i in 1:s
         Π[i,j] = π_z[zi,zj] * π_h[hi,hj]
     end
 end
-# map state -> (z, h) values
-z_of = [z_vals[st[1]] for st in states]
-h_of = [st[2] for st in states]
+
+# maps
+z_of = [z_vals[st[1]] for st in states]   # productivity multiplier (float)
+h_of = [st[2] for st in states]           # health index (1 or 2)
 
 ##########################
-# 2. Mortality / survival schedule by age and health
+# 2. Mortality / survival schedule
 ##########################
-# We'll use a simple Gompertz-like hazard: m(a) = A * exp(B * (a-20))
-# Then scale by health: bad health multiplies mortality.
-A_gomp = 1e-5
+A_gomp = 1e-4
 B_gomp = 0.085
 age_vec = collect(1:A_max)
 mort_base = [A_gomp * exp(B_gomp * (age - 20)) for age in age_vec]
-# ensure probabilities in (0,1)
 mort_base = clamp.(mort_base, 0.0, 0.999)
 
 # health multiplier
-mort_mult = [1.0, 3.0]   # bad health triples mortality
-# survival probability s(age, health) = 1 - mortality
+mort_mult = [1.0, 3.0]
 surv = Array{Float64}(undef, A_max, 2)
 for a in 1:A_max
     for h in 1:2
@@ -95,6 +86,10 @@ for a in 1:A_max
         surv[a,h] = max(0.0, 1.0 - m)
     end
 end
+
+# small quick plot to inspect (optional)
+# plot(mort_base); savefig("figures/ha_health_prod/mort_base.png")
+# plot([surv[:,1] surv[:,2]], label=["healthy" "unhealthy"]); savefig("figures/ha_health_prod/surv.png")
 
 ##########################
 # 3. Utility and intratemporal labor FOC
@@ -110,16 +105,11 @@ function u(c)
     end
 end
 
-function mup(c)  # marginal utility
+function mup(c)
     return c^(-γ)
 end
 
-# Given (a, a', z, h), find optimal labor l in [0,1] solving FOC
-# FOC: mup(c) * w * z = ψ_h * l^φ
-# where c = (1+r)*a + w*z*l - a'
 function optimal_l(a, ap, z, ψ; w=w)
-    # If consumption nonpositive for all l in [0,1], infeasible -> return NaN
-    # Define function f(l) = mup(c(l)) * w*z - ψ * l^φ
     c_at_l(l) = (1 + r) * a + w * z * l - ap
     if c_at_l(0.0) <= 0 && c_at_l(1.0) <= 0
         return NaN
@@ -127,44 +117,35 @@ function optimal_l(a, ap, z, ψ; w=w)
     f(l) = begin
         c = c_at_l(l)
         if c <= 0
-            return 1e6  # large positive so root finder won't pick infeasible region
+            return 1e6
         end
         return mup(c) * w * z - ψ * l^φ
     end
-    # check sign at endpoints
     f0 = f(0.0)
     f1 = f(1.0)
     if f0 < 0 && f1 < 0
-        # marginal benefit < marginal cost everywhere => corner at l=0
         return 0.0
     elseif f0 > 0 && f1 > 0
-        # marginal benefit > marginal cost everywhere => corner at l=1 (if feasible)
         if c_at_l(1.0) > 0
             return 1.0
         else
-            # infeasible at l=1; pick highest feasible l with positive c
-            # try bisection on l to find feasible region where c>0
             return max(0.0, min(1.0, (ap - (1+r)*a) / (w*z) ))
         end
     else
-        # root exists between 0 and 1
         root = find_zero(f, (0.0, 1.0), Bisection(), atol=1e-8)
         return clamp(root, 0.0, 1.0)
     end
 end
 
 ##########################
-# 4. Backward induction: V[a_ind, state_index, age]
+# 4. Backward induction
 ##########################
-# For memory, we keep only V_next and V_curr; store policy functions for all ages
 V_next = zeros(s, na)
 V_curr = similar(V_next)
 policy_ap_idx = Array{Int}(undef, A_max, s, na)
 policy_l = Array{Float64}(undef, A_max, s, na)
 
-# interpolation function helper using simple linear interpolation
 function interp_vec(xgrid, vvec, x)
-    # assume x within [xgrid[1], xgrid[end]]
     if x <= xgrid[1]
         return vvec[1]
     elseif x >= xgrid[end]
@@ -192,10 +173,8 @@ for age in A_max:-1:1
             best_val = -1e20
             best_idx = 1
             best_l = 0.0
-            # choose a' on grid
             for iap in 1:na
                 ap = a_grid[iap]
-                # compute optimal labor for this (a, ap, z, ψ)
                 lstar = optimal_l(a, ap, z, ψ)
                 if isnan(lstar)
                     continue
@@ -205,17 +184,14 @@ for age in A_max:-1:1
                     continue
                 end
                 flow = u(c) - ψ * (lstar^(1+φ)) / (1+φ)
-                # expected continuation value across next states
                 if age == A_max
                     cont = 0.0
                 else
                     cont = 0.0
                     for jstate in 1:s
-                        # interpolate V_next[jstate, :] at ap
                         Vnext_ap = interp_vec(a_grid, V_next[jstate, :], ap)
                         cont += Π[istate, jstate] * Vnext_ap
                     end
-                    # mortality: if die, value is 0; if survive, weight continuation by survival prob
                     cont *= survival
                 end
                 val = flow + β * cont
@@ -230,81 +206,151 @@ for age in A_max:-1:1
             policy_l[age, istate, ia] = best_l
         end
     end
-    # roll forward
     V_next .= V_curr
 end
 
 @printf("Backward induction complete.\n")
 
 ##########################
-# 5. Simulate a cohort forward (micro-simulation)
+# 5. Simulation (with health and productivity paths recorded)
 ##########################
 Tsim = A_max
-Nsim = 20000
+Nsim = 2000
 rng = MersenneTwister(2025)
-# initialize agents at age 1 with zero assets, draw initial states from stationary distribution
-# compute stationary distribution of joint Markov
+
 eigvals, eigvecs = eigen(Π')
 stat = abs.(eigvecs[:, findall(isapprox.(eigvals, 1.0; atol=1e-8))[1]])
 stat = stat / sum(stat)
 
-# sample initial states
 state_dist = Categorical(vec(stat))
+# state_sim contains joint-state indices 1..4
 state_sim = rand(rng, state_dist, Nsim)
-age_sim = ones(Int, Nsim)
-asset_sim = fill(a_grid[1], Nsim)  # start at lowest asset
-cons_sim = zeros(Nsim, Tsim)
-lab_sim = zeros(Nsim, Tsim)
-asset_path = zeros(Nsim, Tsim)
+
+asset_sim = fill(a_grid[1], Nsim)
+alive = trues(Nsim)                     # track who's alive
+
+cons_sim  = fill(NaN, Nsim, Tsim)
+lab_sim   = fill(NaN, Nsim, Tsim)
+asset_path = fill(NaN, Nsim, Tsim)
+
+# NEW: record health and productivity histories as indices (1 or 2)
+health_sim = fill(0, Nsim, Tsim)   # int matrix (1 or 2) for health index
+prod_sim   = fill(0, Nsim, Tsim)   # int matrix (1 or 2) for productivity index
+
+age_death = fill(0, Nsim)
 
 for t in 1:Tsim
     for i in 1:Nsim
+        if !alive[i]
+            continue
+        end
         age = t
         ist = state_sim[i]
-        # find current asset index (nearest)
+        zi, hi = states[ist]      # zi in {1,2}, hi in {1,2}
+        zval = z_vals[zi]
+        # record indices (not floats)
+        health_sim[i,t] = hi
+        prod_sim[i,t]   = zi
+
         ai = findmin(abs.(a_grid .- asset_sim[i]))[2]
         ap_idx = policy_ap_idx[age, ist, ai]
         ap = a_grid[ap_idx]
         l = policy_l[age, ist, ai]
-        c = (1 + r) * asset_sim[i] + w * z_of[ist] * l - ap
-        cons_sim[i, t] = c
-        lab_sim[i, t] = l
-        asset_path[i, t] = asset_sim[i]
-        # draw next state
-        # If at final age, they die; else transition according to Π and mortality
+        c = (1 + r) * asset_sim[i] + w * zval * l - ap
+
+        cons_sim[i,t]  = c
+        lab_sim[i,t]   = l
+        asset_path[i,t] = asset_sim[i]
+
         if age == A_max
-            # terminal: set next asset to NaN
+            alive[i] = false
+            age_death[i] = age
             asset_sim[i] = NaN
-            state_sim[i] = ist
         else
-            # draw next joint state
-            state_sim[i] = rand(rng, Categorical(vec(Π[ist, :])))
-            # apply survival: if die, mark as dead and stop tracking
-            h_ind = h_of[state_sim[i]]
-            survprob = surv[age, h_ind]
+            next_state = rand(rng, Categorical(vec(Π[ist, :])))
+            survprob = surv[age, hi]   # survival prob depends on current age & health index
             if rand(rng) > survprob
-                # agent dies: we fill remaining with NaN and remove from sim
-                # for simplicity, set asset to NaN
+                alive[i] = false
+                age_death[i] = age
                 asset_sim[i] = NaN
-                state_sim[i] = 0
+                state_sim[i] = 0       # sentinel, will be ignored because alive=false
             else
+                state_sim[i] = next_state
                 asset_sim[i] = ap
             end
         end
     end
 end
 
-@printf("Simulation complete (N=%d, T=%d). Sample means at midlife (age=45):\n", Nsim, Tsim)
-mid = min(Tsim, 45)
-alive = .!isnan.(asset_path[:, mid])
-@printf(" Mean assets: %.3f, Mean consumption: %.3f, Mean labor: %.3f (at age %d)\n", mean(asset_path[alive, mid]), mean(cons_sim[alive, mid]), mean(lab_sim[alive, mid]), mid)
+@printf("Simulation complete.\n")
 
 ##########################
-# 6. Outputs saved or available in memory
-# - policy_ap_idx[age, state, a_index]
-# - policy_l[age, state, a_index]
-# - V_curr/V_next final values for age=1 value function
-# - simulation arrays: cons_sim, lab_sim, asset_path
+# 6. Plots of key outputs (handle NaNs)
 ##########################
 
+# helper safe mean that returns NaN if no valid observations
+safemean(v) = begin
+    vals = filter(!isnan, v)
+    isempty(vals) ? NaN : mean(vals)
+end
+
+# create output dir if needed
+outdir = "figures/ha_health_prod"
+mkpath(outdir)
+
+# (optional) frequency of final joint states among still-alive agents: ignore zeros/sentinels
+alive_final_states = state_sim[state_sim .> 0]  # this includes last-drawn states, but may include dead -> sentinel removed
+# If you want counts by state at a given age, better compute during simulation. For quick check:
+try
+    freq = freqtable(alive_final_states)
+    @show freq
+catch
+    @warn "freqtable failed (maybe no nonzero states present)"
+end
+
+# Aggregate means
+mean_assets = [safemean(asset_path[:,t]) for t in 1:Tsim]
+mean_cons   = [safemean(cons_sim[:,t])   for t in 1:Tsim]
+mean_lab    = [safemean(lab_sim[:,t])    for t in 1:Tsim]
+
+p1 = plot(age_vec, mean_assets, xlabel="Age", ylabel="Assets", title="Mean Assets (All Agents)", legend=false)
+p2 = plot(age_vec, mean_cons,   xlabel="Age", ylabel="Consumption", title="Mean Consumption (All Agents)", legend=false)
+p3 = plot(age_vec, mean_lab,    xlabel="Age", ylabel="Labor", title="Mean Labor (All Agents)", legend=false)
+plot(p1,p2,p3, layout=(3,1), size=(700,900))
+savefig(joinpath(outdir, "lifecycle_profiles.pdf"))
+
+# By health (good=1, bad=2)
+colors = [:blue, :red]
+labels = ["Healthy","Unhealthy"]
+ph1 = plot(title="Assets by Health", xlabel="Age", ylabel="Assets")
+ph2 = plot(title="Consumption by Health", xlabel="Age", ylabel="Consumption")
+ph3 = plot(title="Labor by Health", xlabel="Age", ylabel="Labor")
+for h in 1:2
+    aset = [ safemean(asset_path[health_sim[:,t] .== h, t]) for t in 1:Tsim ]
+    cons = [ safemean(cons_sim[health_sim[:,t] .== h, t])   for t in 1:Tsim ]
+    lab  = [ safemean(lab_sim[health_sim[:,t] .== h, t])    for t in 1:Tsim ]
+    plot!(ph1, age_vec, aset, label=labels[h], color=colors[h])
+    plot!(ph2, age_vec, cons, label=labels[h], color=colors[h])
+    plot!(ph3, age_vec, lab,  label=labels[h], color=colors[h])
+end
+plot(ph1,ph2,ph3, layout=(3,1), size=(700,900))
+savefig(joinpath(outdir, "profiles_by_health.png"))
+
+# By productivity (1=low, 2=high)
+labels_prod = ["Low Prod","High Prod"]
+pp1 = plot(title="Assets by Productivity", xlabel="Age", ylabel="Assets")
+pp2 = plot(title="Consumption by Productivity", xlabel="Age", ylabel="Consumption")
+pp3 = plot(title="Labor by Productivity", xlabel="Age", ylabel="Labor")
+for j in 1:2
+    aset = [ safemean(asset_path[prod_sim[:,t] .== j, t]) for t in 1:Tsim ]
+    cons = [ safemean(cons_sim[prod_sim[:,t] .== j, t])   for t in 1:Tsim ]
+    lab  = [ safemean(lab_sim[prod_sim[:,t] .== j, t])    for t in 1:Tsim ]
+    plot!(pp1, age_vec, aset, label=labels_prod[j])
+    plot!(pp2, age_vec, cons, label=labels_prod[j])
+    plot!(pp3, age_vec, lab,  label=labels_prod[j])
+end
+plot(pp1,pp2,pp3, layout=(3,1), size=(700,900))
+savefig(joinpath(outdir, "profiles_by_productivity.png"))
+
+@printf("Plots saved in %s\n", outdir)
 # End of file
