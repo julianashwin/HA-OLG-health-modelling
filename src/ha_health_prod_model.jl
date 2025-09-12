@@ -21,7 +21,6 @@ using LinearAlgebra
 using Statistics, Random, Distributions
 using Printf, Plots, FreqTables
 using Interpolations, Roots
-using Filesystem: mkpath
 
 ##########################
 # 0. High-level choices
@@ -69,16 +68,40 @@ z_of = [z_vals[st[1]] for st in states]   # productivity multiplier (float)
 h_of = [st[2] for st in states]           # health index (1 or 2)
 
 ##########################
-# 2. Mortality / survival schedule
+# 2. Mortality / survival schedule by age and health (Gompertz--Makeham)
 ##########################
-A_gomp = 1e-4
-B_gomp = 0.085
+# Gompertz--Makeham hazard: m(a) = C + A * exp(B * (a - offset))
+C_makeham = 0.0005       # Makeham constant (age-independent baseline)
+B_gomp    = 0.0966        # Gompertz slope (kept from prior)
+A_gomp   =  0.3319  # calibrated Gompertz scale
+
 age_vec = collect(1:A_max)
-mort_base = [A_gomp * exp(B_gomp * (age - 20)) for age in age_vec]
+mort_base = [C_makeham + A_gomp * exp(B_gomp * (age - 97.6)) for age in age_vec]
+# keep hazards in (0,1)
 mort_base = clamp.(mort_base, 0.0, 0.999)
 
-# health multiplier
-mort_mult = [1.0, 3.0]
+
+
+# compute implied life expectancy (discrete ages, death probability at each age)
+surv_uncond = ones(Float64, A_max)
+for t in 2:A_max
+    surv_uncond[t] = surv_uncond[t-1] * (1.0 - mort_base[t-1])
+end
+prob_die = similar(mort_base)
+for t in 1:A_max
+    prob_die[t] = surv_uncond[t] * mort_base[t]
+end
+# survivors beyond last age are treated as dying at age A (consistent with simulation)
+exp_age = sum((1:A_max) .* prob_die) + surv_uncond[end] * A_max
+@printf("Implied life expectancy (ages 1..%d, terminal death at %d): %.4f\n", A_max, A_max, exp_age)
+
+plot(mort_base)
+plot!(surv_uncond)
+
+# health multiplier (unchanged)
+mort_mult = [1.0, 3.0]   # bad health triples mortality
+
+# survival probability s(age, health) = 1 - mortality
 surv = Array{Float64}(undef, A_max, 2)
 for a in 1:A_max
     for h in 1:2
@@ -87,9 +110,10 @@ for a in 1:A_max
     end
 end
 
-# small quick plot to inspect (optional)
-# plot(mort_base); savefig("figures/ha_health_prod/mort_base.png")
-# plot([surv[:,1] surv[:,2]], label=["healthy" "unhealthy"]); savefig("figures/ha_health_prod/surv.png")
+# Mortality plots (uncomment to view)
+# plot(age_vec, mort_base, xlabel="Age", ylabel="Hazard m(a)", title="Gompertz-Makeham hazard")
+# plot(age_vec, surv[:,1], label="Healthy"); plot!(age_vec, surv[:,2], label="Unhealthy", xlabel="Age", ylabel="Survival prob")
+
 
 ##########################
 # 3. Utility and intratemporal labor FOC
