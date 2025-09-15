@@ -23,21 +23,6 @@ using Printf, Plots, FreqTables
 using Interpolations, Roots
 using Distributed, SharedArrays
 
-# Check if we need to add processes
-if nprocs() == 1
-    addprocs(4)  # Add 4 worker processes
-end
-
-@everywhere using LinearAlgebra, Statistics, SharedArrays, Interpolations, Roots
-
-function check_everywhere(var::Symbol)
-    results = Dict()
-    for p in workers() ∪ [myid()]
-        results[p] = @fetchfrom p isdefined(Main, var)
-    end
-    return results
-end
-
 
 ##########################
 # 0. High-level choices
@@ -75,23 +60,6 @@ a_grid = create_asset_grid(a_min, a_max, na)
 @assert length(a_grid) == length(unique(a_grid)) "Asset grid has duplicates!"
 
 
-# Helper function to send variables to workers
-function sendto(processes; kwargs...)
-    for p in processes
-        for (var, val) in kwargs
-            @spawnat p eval(:($(Symbol(var)) = $(val)))
-        end
-    end
-end
-
-# Send the parameter values
-sendto(workers(), r=r)
-sendto(workers(), β=β) 
-sendto(workers(), γ=γ)
-sendto(workers(), φ=φ)
-sendto(workers(), w=w)
-sendto(workers(), a_grid=a_grid)
-
 
 
 ##########################
@@ -118,14 +86,6 @@ end
 # maps
 z_of = [z_vals[st[1]] for st in states]   # productivity multiplier (float)
 h_of = [st[2] for st in states]           # health index (1 or 2)
-
-
-# Send the maps and distributions
-sendto(workers(), z_of=z_of)
-sendto(workers(), h_of=h_of) 
-sendto(workers(), ψ_h=ψ_h) 
-sendto(workers(), Π=Π) 
-sendto(workers(), s=s) 
 
 
 ##########################
@@ -164,15 +124,72 @@ mort_mult = [1.0, 3.0]   # bad health triples mortality
 
 # survival probability s(age, health) = 1 - mortality
 surv = max.(0.0, 1.0 .- mort_base .* (mort_mult')) 
-@everywhere surv = $surv
 
 # Mortality plots (uncomment to view)
 # plot(age_vec, mort_base, xlabel="Age", ylabel="Hazard m(a)", title="Gompertz-Makeham hazard")
 # plot(age_vec, surv[:,1], label="Healthy"); plot!(age_vec, surv[:,2], label="Unhealthy", xlabel="Age", ylabel="Survival prob")
 
 
+
+
 ##########################
-# 3. Utility and intratemporal labor FOC
+# 3. Set up workers for parallel processing
+##########################
+println("Setting up workers with shared memory...")
+# Check if we need to add processes
+if nprocs() == 1
+    addprocs(4)  # Add 4 worker processes
+end
+# Import packages on workers
+@everywhere using LinearAlgebra, Statistics, SharedArrays, Interpolations, Roots
+
+# Send parameters to workers 
+@sync for p in workers()
+    @spawnat p eval(quote
+        # Scalar parameters
+        r = $r
+        β = $β
+        γ = $γ
+        φ = $φ
+        w = $w
+        s = $s
+        A_max = $A_max
+        na = $na
+        
+        # Arrays  
+        a_grid = $a_grid
+        z_of = $z_of
+        h_of = $h_of
+        ψ_h = $ψ_h
+        Π = $Π
+        surv = $surv
+    end)
+end
+
+# Verify everything worked
+println("Verifying worker setup...")
+for p in workers()
+    try
+        result = @fetchfrom p (r, β, length(a_grid), s)
+        println("✓ Worker $p: r=$(result[1]), β=$(result[2]), na=$(result[3]), s=$(result[4])")
+    catch e
+        println("✗ Worker $p failed: $e")
+    end
+end
+
+function check_everywhere(var::Symbol)
+    results = Dict()
+    for p in workers() ∪ [myid()]
+        results[p] = @fetchfrom p isdefined(Main, var)
+    end
+    return results
+end
+
+
+check_everywhere(:a_grid)
+
+##########################
+# 4. Utility and intratemporal labor FOC
 ##########################
 @everywhere function u(c)
     if c <= 0
@@ -224,78 +241,71 @@ end
 end
 
 ##########################
-# 4. Backward induction
+# 5. Backward induction
 ##########################
-@everywhere function update_interpolators!(V_interpolators, a_grid, V_next)
-    for j in 1:s
-        V_interpolators[j] = LinearInterpolation(a_grid, V_next[j,:], 
-                                                extrapolation_bc=Line())
-    end
-end
-
 
 # Initialise value and policy functions
 V_next = SharedArray{Float64}(s, na)
 V_curr = SharedArray{Float64}(s, na) 
 policy_ap_idx = SharedArray{Int}(A_max, s, na)
 policy_l = SharedArray{Float64}(A_max, s, na)
-
 # Initialize with zeros
 fill!(V_next, 0.0)
 fill!(V_curr, 0.0)
 
 
-# Pre-create interpolation objects for each state
-V_interpolators = Vector{Any}(undef, s)
-# Initialize with zeros for the first iteration
-update_interpolators!(V_interpolators, a_grid, V_next)
-@everywhere V_interpolators = $V_interpolators
-
-
-check_everywhere(:V_interpolators)
-
 
 @printf("Starting backward induction for A_max=%d, na=%d, nstates=%d\n", A_max, na, s)
 @printf("Running on %d processes\n", nprocs())
 for age in A_max:-1:1
-    @printf(" Solving age %3d\n", age)    
-    # Send current age to all workers
-    sendto(workers(), current_age=age)
+    @printf(" Solving age %3d\n", age)
+    @everywhere current_age = $age
     
-    @distributed for istate in 1:s
+    @sync @distributed for istate in 1:s
         z = z_of[istate]
         h_ind = h_of[istate]
         ψ = ψ_h[h_ind]
-        survival = surv[age, h_ind]
-
-        for ia in 1:length(a_grid)
+        survival = surv[current_age, h_ind]
+        
+        # Create interpolators locally (this is actually fastest!)
+        local_interpolators = if current_age < A_max
+            [LinearInterpolation(a_grid, V_next[j,:], extrapolation_bc=Line()) 
+             for j in 1:s]
+        else
+            nothing  # Not needed for terminal age
+        end
+        
+        for ia in 1:na
             a = a_grid[ia]
             best_val = -1e20
             best_idx = 1
             best_l = 0.0
-
-            for iap in 1:length(a_grid)
+            
+            for iap in 1:na
                 ap = a_grid[iap]
                 lstar = optimal_l(a, ap, z, ψ)
-                if isnan(lstar)
+                if lstar == 0.0 && ap > (1+r)*a
                     continue
                 end
+                
                 c = (1 + r) * a + w * z * lstar - ap
                 if c <= 0
                     continue
                 end
+                
                 flow = u(c) - ψ * (lstar^(1+φ)) / (1+φ)
+                
                 if current_age == A_max
                     cont = 0.0
                 else
                     cont = 0.0
                     for jstate in 1:s
-                        # Use the pre-built interpolator
-                        Vnext_ap = V_interpolators[jstate](ap)
+                        Vnext_ap = local_interpolators[jstate](ap)
                         cont += Π[istate, jstate] * Vnext_ap
                     end
                     cont *= survival
                 end
+                
                 val = flow + β * cont
                 if val > best_val
                     best_val = val
@@ -303,28 +313,20 @@ for age in A_max:-1:1
                     best_l = lstar
                 end
             end
+            
             V_curr[istate, ia] = best_val
-            policy_ap_idx[age, istate, ia] = best_idx
-            policy_l[age, istate, ia] = best_l
+            policy_ap_idx[current_age, istate, ia] = best_idx
+            policy_l[current_age, istate, ia] = best_l
         end
     end
-
-    # Synchronize: wait for all workers to finish
-    @sync @distributed for i in 1:s
-        nothing  # Just to ensure synchronization
-    end
     
-    # Update for next iteration
     V_next .= V_curr
-    # UPDATE THE INTERPOLATORS with new V_next values
-    update_interpolators!(V_interpolators, a_grid, V_next)
-    @everywhere V_interpolators = $V_interpolators
 end
 
 @printf("Backward induction complete.\n")
 
 ##########################
-# 5. Simulation (with health and productivity paths recorded)
+# 6. Simulation (with health and productivity paths recorded)
 ##########################
 Tsim = A_max
 Nsim = 2000
@@ -345,6 +347,8 @@ cons_sim = Matrix{Float64}(undef, Nsim, Tsim)
 lab_sim = Matrix{Float64}(undef, Nsim, Tsim)
 health_sim = Matrix{Int8}(undef, Nsim, Tsim)  # Int8 sufficient for 1/2 values
 prod_sim = Matrix{Int8}(undef, Nsim, Tsim)
+asset_path = Matrix{Float64}(undef, Nsim, Tsim)
+
 
 # NEW: record health and productivity histories as indices (1 or 2)
 health_sim = fill(0, Nsim, Tsim)   # int matrix (1 or 2) for health index
@@ -398,7 +402,7 @@ end
 @printf("Simulation complete.\n")
 
 ##########################
-# 6. Plots of key outputs (handle NaNs)
+# 7. Plots of key outputs (handle NaNs)
 ##########################
 
 # helper safe mean that returns NaN if no valid observations
