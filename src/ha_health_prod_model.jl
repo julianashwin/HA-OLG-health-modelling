@@ -21,6 +21,23 @@ using LinearAlgebra
 using Statistics, Random, Distributions
 using Printf, Plots, FreqTables
 using Interpolations, Roots
+using Distributed, SharedArrays
+
+# Check if we need to add processes
+if nprocs() == 1
+    addprocs(4)  # Add 4 worker processes
+end
+
+@everywhere using LinearAlgebra, Statistics, SharedArrays, Interpolations, Roots
+
+function check_everywhere(var::Symbol)
+    results = Dict()
+    for p in workers() ∪ [myid()]
+        results[p] = @fetchfrom p isdefined(Main, var)
+    end
+    return results
+end
+
 
 ##########################
 # 0. High-level choices
@@ -35,12 +52,47 @@ r = 0.03
 ψ_bad = 2.0
 w = 1.0
 
-# asset grid
+# asset grid: finer grid closer to zero
+function create_asset_grid(a_min, a_max, na_target)
+    # More careful construction to avoid overlaps
+    # Dense near zero, medium density in middle, coarse at high values
+    n1, n2, n3 = 50, 150, na_target - 50 - 150
+    # Segment 1: a_min to 1.0
+    seg1 = range(a_min, 1.0, length=n1+1)[1:end-1]  # exclude endpoint
+    # Segment 2: 1.0 to 10.0  
+    seg2 = range(1.0, 10.0, length=n2+1)[1:end-1]   # exclude endpoint
+    # Segment 3: 10.0 to a_max
+    seg3 = range(10.0, a_max, length=n3)          # include endpoint
+
+    return [collect(seg1); collect(seg2); collect(seg3)]
+end
+
 na = 500
 a_min = 0.0
 a_max = 200.0
-a_grid = [a_min; collect(range(1e-6, 1.0, length=50)); collect(range(1.0,10.0,length=150)); collect(range(10.0,a_max,length=na-201))]
-na = length(a_grid)
+a_grid = create_asset_grid(a_min, a_max, na)
+@assert na == length(a_grid) "Asset grid is the wrong length"
+@assert length(a_grid) == length(unique(a_grid)) "Asset grid has duplicates!"
+
+
+# Helper function to send variables to workers
+function sendto(processes; kwargs...)
+    for p in processes
+        for (var, val) in kwargs
+            @spawnat p eval(:($(Symbol(var)) = $(val)))
+        end
+    end
+end
+
+# Send the parameter values
+sendto(workers(), r=r)
+sendto(workers(), β=β) 
+sendto(workers(), γ=γ)
+sendto(workers(), φ=φ)
+sendto(workers(), w=w)
+sendto(workers(), a_grid=a_grid)
+
+
 
 ##########################
 # 1. Binary Markov processes
@@ -66,6 +118,15 @@ end
 # maps
 z_of = [z_vals[st[1]] for st in states]   # productivity multiplier (float)
 h_of = [st[2] for st in states]           # health index (1 or 2)
+
+
+# Send the maps and distributions
+sendto(workers(), z_of=z_of)
+sendto(workers(), h_of=h_of) 
+sendto(workers(), ψ_h=ψ_h) 
+sendto(workers(), Π=Π) 
+sendto(workers(), s=s) 
+
 
 ##########################
 # 2. Mortality / survival schedule by age and health (Gompertz--Makeham)
@@ -102,13 +163,8 @@ plot!(surv_uncond)
 mort_mult = [1.0, 3.0]   # bad health triples mortality
 
 # survival probability s(age, health) = 1 - mortality
-surv = Array{Float64}(undef, A_max, 2)
-for a in 1:A_max
-    for h in 1:2
-        m = mort_base[a] * mort_mult[h]
-        surv[a,h] = max(0.0, 1.0 - m)
-    end
-end
+surv = max.(0.0, 1.0 .- mort_base .* (mort_mult')) 
+@everywhere surv = $surv
 
 # Mortality plots (uncomment to view)
 # plot(age_vec, mort_base, xlabel="Age", ylabel="Hazard m(a)", title="Gompertz-Makeham hazard")
@@ -118,7 +174,7 @@ end
 ##########################
 # 3. Utility and intratemporal labor FOC
 ##########################
-function u(c)
+@everywhere function u(c)
     if c <= 0
         return -1e20
     end
@@ -129,15 +185,21 @@ function u(c)
     end
 end
 
-function mup(c)
+@everywhere function mup(c)
     return c^(-γ)
 end
 
-function optimal_l(a, ap, z, ψ; w=w)
+@everywhere function optimal_l(a, ap, z, ψ; w=w)
     c_at_l(l) = (1 + r) * a + w * z * l - ap
-    if c_at_l(0.0) <= 0 && c_at_l(1.0) <= 0
-        return NaN
+
+    # Add bounds checking
+    @assert 0 ≤ a "Negative assets not allowed"
+    @assert 0 ≤ ap "Negative next-period assets not allowed"
+    
+    if c_at_l(0.0) ≤ 0 && c_at_l(1.0) ≤ 0
+        return 0.0  # Return 0 instead of NaN
     end
+
     f(l) = begin
         c = c_at_l(l)
         if c <= 0
@@ -164,40 +226,55 @@ end
 ##########################
 # 4. Backward induction
 ##########################
-V_next = zeros(s, na)
-V_curr = similar(V_next)
-policy_ap_idx = Array{Int}(undef, A_max, s, na)
-policy_l = Array{Float64}(undef, A_max, s, na)
-
-function interp_vec(xgrid, vvec, x)
-    if x <= xgrid[1]
-        return vvec[1]
-    elseif x >= xgrid[end]
-        return vvec[end]
+@everywhere function update_interpolators!(V_interpolators, a_grid, V_next)
+    for j in 1:s
+        V_interpolators[j] = LinearInterpolation(a_grid, V_next[j,:], 
+                                                extrapolation_bc=Line())
     end
-    i = searchsortedfirst(xgrid, x)
-    if xgrid[i] == x
-        return vvec[i]
-    end
-    i0 = i-1
-    w = (x - xgrid[i0]) / (xgrid[i] - xgrid[i0])
-    return (1-w)*vvec[i0] + w*vvec[i]
 end
 
+
+# Initialise value and policy functions
+V_next = SharedArray{Float64}(s, na)
+V_curr = SharedArray{Float64}(s, na) 
+policy_ap_idx = SharedArray{Int}(A_max, s, na)
+policy_l = SharedArray{Float64}(A_max, s, na)
+
+# Initialize with zeros
+fill!(V_next, 0.0)
+fill!(V_curr, 0.0)
+
+
+# Pre-create interpolation objects for each state
+V_interpolators = Vector{Any}(undef, s)
+# Initialize with zeros for the first iteration
+update_interpolators!(V_interpolators, a_grid, V_next)
+@everywhere V_interpolators = $V_interpolators
+
+
+check_everywhere(:V_interpolators)
+
+
 @printf("Starting backward induction for A_max=%d, na=%d, nstates=%d\n", A_max, na, s)
+@printf("Running on %d processes\n", nprocs())
 for age in A_max:-1:1
-    @printf(" Solving age %3d\n", age)
-    for istate in 1:s
+    @printf(" Solving age %3d\n", age)    
+    # Send current age to all workers
+    sendto(workers(), current_age=age)
+    
+    @distributed for istate in 1:s
         z = z_of[istate]
         h_ind = h_of[istate]
         ψ = ψ_h[h_ind]
         survival = surv[age, h_ind]
-        for ia in 1:na
+
+        for ia in 1:length(a_grid)
             a = a_grid[ia]
             best_val = -1e20
             best_idx = 1
             best_l = 0.0
-            for iap in 1:na
+
+            for iap in 1:length(a_grid)
                 ap = a_grid[iap]
                 lstar = optimal_l(a, ap, z, ψ)
                 if isnan(lstar)
@@ -208,12 +285,13 @@ for age in A_max:-1:1
                     continue
                 end
                 flow = u(c) - ψ * (lstar^(1+φ)) / (1+φ)
-                if age == A_max
+                if current_age == A_max
                     cont = 0.0
                 else
                     cont = 0.0
                     for jstate in 1:s
-                        Vnext_ap = interp_vec(a_grid, V_next[jstate, :], ap)
+                        # Use the pre-built interpolator
+                        Vnext_ap = V_interpolators[jstate](ap)
                         cont += Π[istate, jstate] * Vnext_ap
                     end
                     cont *= survival
@@ -230,7 +308,17 @@ for age in A_max:-1:1
             policy_l[age, istate, ia] = best_l
         end
     end
+
+    # Synchronize: wait for all workers to finish
+    @sync @distributed for i in 1:s
+        nothing  # Just to ensure synchronization
+    end
+    
+    # Update for next iteration
     V_next .= V_curr
+    # UPDATE THE INTERPOLATORS with new V_next values
+    update_interpolators!(V_interpolators, a_grid, V_next)
+    @everywhere V_interpolators = $V_interpolators
 end
 
 @printf("Backward induction complete.\n")
@@ -253,9 +341,10 @@ state_sim = rand(rng, state_dist, Nsim)
 asset_sim = fill(a_grid[1], Nsim)
 alive = trues(Nsim)                     # track who's alive
 
-cons_sim  = fill(NaN, Nsim, Tsim)
-lab_sim   = fill(NaN, Nsim, Tsim)
-asset_path = fill(NaN, Nsim, Tsim)
+cons_sim = Matrix{Float64}(undef, Nsim, Tsim)
+lab_sim = Matrix{Float64}(undef, Nsim, Tsim)
+health_sim = Matrix{Int8}(undef, Nsim, Tsim)  # Int8 sufficient for 1/2 values
+prod_sim = Matrix{Int8}(undef, Nsim, Tsim)
 
 # NEW: record health and productivity histories as indices (1 or 2)
 health_sim = fill(0, Nsim, Tsim)   # int matrix (1 or 2) for health index
